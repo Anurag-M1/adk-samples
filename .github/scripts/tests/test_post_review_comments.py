@@ -654,6 +654,125 @@ def test_diff_trimmed_mid_utf8_character_does_not_crash(tmp_path):
     )
 
 
+def test_restrict_to_pr_drops_lines_the_pr_does_not_add():
+    # Incremental diff across a base-branch merge: line 2 came from base.
+    incremental = {"x.py": {1, 2, 3}, "y.py": {5}}
+    pr_diff = "--- a/x.py\n+++ b/x.py\n@@ -1,2 +1,3 @@\n+one\n two\n+three\n"
+    restricted = m.restrict_to_pr(incremental, pr_diff)
+    assert restricted == {"x.py": {1, 3}, "y.py": set()}
+
+
+def test_pr_diff_keeps_base_branch_lines_out_of_inline_comments(tmp_path):
+    """#2677: every comment was on a line a merge from main brought in.
+
+    The incremental diff showed that line as added, so it passed validation,
+    and GitHub then rejected the comment with HTTP 422 because the line is
+    not in the PR's own diff.
+    """
+    result = tmp_path / "agy_result.json"
+    result.write_text(
+        json.dumps(
+            {
+                "response": (
+                    '```json\n[{"path": "x.py", "line": 2, "body": "from '
+                    'base"}, {"path": "x.py", "line": 3, "body": "from pr"}]'
+                    "\n```"
+                )
+            }
+        ),
+        encoding="utf-8",
+    )
+    incremental = tmp_path / "pr_diff_used.txt"
+    incremental.write_text(
+        "--- a/x.py\n+++ b/x.py\n@@ -0,0 +1,3 @@\n+one\n+two\n+three\n",
+        encoding="utf-8",
+    )
+    whole = tmp_path / "pr_diff_full.txt"
+    whole.write_text(
+        "--- a/x.py\n+++ b/x.py\n@@ -1,2 +1,3 @@\n+one\n two\n+three\n",
+        encoding="utf-8",
+    )
+
+    def run(*extra: str) -> list[int]:
+        out = tmp_path / "review_payload.json"
+        out.unlink(missing_ok=True)
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--result",
+                str(result),
+                "--diff",
+                str(incremental),
+                *extra,
+                "--label",
+                "Correctness",
+                "--out",
+                str(out),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        payload = json.loads(out.read_text(encoding="utf-8"))
+        return sorted(c["line"] for c in payload["comments"])
+
+    assert run() == [2, 3]
+    assert run("--pr-diff", str(whole)) == [3]
+
+
+def test_unreadable_pr_diff_is_a_ci_fault(tmp_path):
+    result = tmp_path / "agy_result.json"
+    result.write_text(json.dumps({"response": "[]"}), encoding="utf-8")
+    diff_file = tmp_path / "pr_diff_used.txt"
+    diff_file.write_text("", encoding="utf-8")
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--result",
+            str(result),
+            "--diff",
+            str(diff_file),
+            "--pr-diff",
+            str(tmp_path / "missing.txt"),
+            "--label",
+            "Correctness",
+            "--out",
+            str(tmp_path / "out.json"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "cannot read diff" in proc.stdout
+
+
+def test_the_workflow_passes_the_whole_pr_diff_for_anchors():
+    import yaml
+
+    workflow = (
+        Path(__file__).resolve().parents[3]
+        / ".github"
+        / "workflows"
+        / "_ai-pr-review-core.yml"
+    )
+    steps = yaml.safe_load(workflow.read_text(encoding="utf-8"))["jobs"][
+        "review"
+    ]["steps"]
+    fetch = next(s for s in steps if s.get("id") == "fetch_diff")["run"]
+    build = next(s for s in steps if s.get("id") == "build_review")["run"]
+    assert "pr_diff_full.txt" in fetch
+    assert "--pr-diff pr_diff_full.txt" in build
+    assert "--pr-diff" in {
+        opt
+        for action in m.build_parser()._actions
+        for opt in action.option_strings
+    }
+
+
 def test_workflow_invokes_this_script_with_the_flags_it_defines():
     """Pin the workflow -> CLI contract.
 
@@ -3474,3 +3593,61 @@ def test_the_ci_fail_signal_matches_the_checker_that_writes_it():
     )
     assert found, "check_house_rules.py no longer defines CI_FAIL"
     assert found.group(1) == m.CI_FAIL
+
+
+# --------------------------------------------------------------------------
+# Truncated model output, and git-quoted paths. Both were silent losses: the
+# first turned a recoverable response into a red check, the second dropped
+# every finding in any file whose name git quotes.
+# --------------------------------------------------------------------------
+
+TRUNCATED_RESPONSE = (
+    "Here are my findings:\n\n"
+    "```json\n"
+    "[\n"
+    '  {"path": "a.py", "line": 10, "body": "first", "window": "10: x = 1"},\n'
+    '  {"path": "b.py", "line": 20, "body": "second find'
+)
+
+
+def test_truncated_response_salvages_complete_findings():
+    """An output-limit hit must not cost a red check.
+
+    FENCED_BLOCK cannot match without its closing fence, and the bare-"["
+    fallback does not fire because the response opens with the fence. That
+    combination raised ReviewerOutputError -> exit 2 -> a failure comment on
+    the contributor's PR, discarding findings that had parsed cleanly.
+    """
+    findings = m.extract_findings(TRUNCATED_RESPONSE)
+    assert [f["path"] for f in findings] == ["a.py"]
+
+
+def test_response_with_no_array_at_all_still_raises():
+    """The salvage path must not swallow a genuinely empty response."""
+    with pytest.raises(m.ReviewerOutputError):
+        m.extract_findings("I reviewed the PR and found no issues.")
+
+
+def _one_file_diff(header: str) -> str:
+    return f"diff --git x y\n--- a/x\n{header}\n@@ -0,0 +1,1 @@\n+import os\n"
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ('+++ "b/my recipe/agent.py"', "my recipe/agent.py"),
+        ('+++ "b/caf\\303\\251.py"', "café.py"),
+        ("+++ b/app/agent.py", "app/agent.py"),
+        # A real top-level `b/` directory: only git's own prefix comes off.
+        ("+++ b/b/thing.py", "b/thing.py"),
+    ],
+)
+def test_walk_right_side_reads_quoted_paths(header, expected):
+    """core.quotePath is on by default, so this is the normal shape.
+
+    Unquoting has to happen BEFORE the side prefix is stripped: in
+    `"b/x"` the `b/` sits inside the quotes, so a raw startswith() test
+    never fires and the key keeps both the quotes and the prefix.
+    """
+    anchors, _ = m.walk_right_side(_one_file_diff(header))
+    assert list(anchors.keys()) == [expected]

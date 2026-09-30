@@ -79,6 +79,14 @@ from ci_message import (
     report_infra_fault,
 )
 
+# Imported, not re-implemented: prepare_review_diff already fixed this exact
+# defect on its side, with tests. Duplicating is how the two drifted apart.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from prepare_review_diff import (
+    _strip_side_prefix,
+    _unquote_git_path,
+)
+
 CHECKER = "post_review_comments.py"
 
 # Findings carrying this `source` came from house_rules_lane.py rather than
@@ -196,6 +204,14 @@ HUNK_HEADER = re.compile(
 # "]" in the block swallowed anything the model appended after the array.
 # json's own parser draws that boundary in extract_findings instead.
 FENCED_BLOCK = re.compile(r"```(?:json)?\s*(\[.*?)```", re.DOTALL)
+
+# An opening fence with NO closing fence: a response truncated mid-array.
+# Without this, FENCED_BLOCK cannot match and the bare-"[" fallback does not
+# fire either (the response starts with the fence), so extract_findings raised
+# and exited 2 -- a red check, discarding findings that had parsed fine. The
+# repair and salvage paths downstream already handle a block that stops
+# mid-object; nothing was reaching them.
+UNTERMINATED_FENCED_BLOCK = re.compile(r"```(?:json)?\s*(\[.*)", re.DOTALL)
 
 # A window row: "  42: os.system(cmd)". Both ":" and "|" are seen as the
 # separator, and the leading whitespace is the model aligning its numbers.
@@ -347,6 +363,18 @@ def _strip_diff_prefix(path: str) -> str:
     return path
 
 
+def _header_path(target: str) -> str:
+    """A `+++ ` header's path, as GitHub will report it.
+
+    With `core.quotePath` on -- the default -- git quotes and C-escapes any
+    path holding a space, a quote or a non-ASCII byte: `+++ "b/my recipe/x.py"`.
+    The quotes then stay in the key AND the `b/` prefix sits inside them, so
+    the prefix strip never fires, and every finding in that file is dropped as
+    unanchorable. Unquote first, strip second -- the order is load-bearing.
+    """
+    return _strip_side_prefix(_unquote_git_path(target))
+
+
 def _resolve_path(reported: str, anchors: dict[str, set[int]]) -> str:
     """Match the model's path against the paths the diff actually names.
 
@@ -407,11 +435,7 @@ def walk_right_side(
             # Between hunks: the only place a row can be a file header.
             if row.startswith("+++ "):
                 target = row[4:].strip()
-                path = (
-                    None
-                    if target == "/dev/null"
-                    else _strip_diff_prefix(target)
-                )
+                path = None if target == "/dev/null" else _header_path(target)
                 continue
             header = HUNK_HEADER.match(row)
             if header:
@@ -447,6 +471,29 @@ def walk_right_side(
 def added_line_anchors(diff: str) -> dict[str, set[int]]:
     """The new-file lines each path adds. See walk_right_side."""
     return walk_right_side(diff)[0]
+
+
+def restrict_to_pr(
+    anchors: dict[str, set[int]], pr_diff: str
+) -> dict[str, set[int]]:
+    """Keep only the anchors the PR's own base...head diff also adds.
+
+    An incremental diff (last reviewed commit...head) taken across a merge of
+    the base branch marks everything that landed on base in between as
+    added. Those lines are not in the PR's diff, so GitHub rejects a comment
+    on one with HTTP 422, and when every comment in a run is such a line the
+    post job fails. Both diffs end at head, so new-file line numbers agree
+    and a plain intersection is enough. A dropped anchor is not lost: its
+    finding still verifies against the line text and goes in the review body.
+
+    Every path keeps its key, even with no anchors left, so path resolution
+    against the reviewed diff behaves as before.
+    """
+    pr_anchors = added_line_anchors(pr_diff)
+    return {
+        path: lines & pr_anchors.get(path, set())
+        for path, lines in anchors.items()
+    }
 
 
 def extract_findings(response: str) -> list:
@@ -493,11 +540,21 @@ def extract_findings(response: str) -> list:
     one malformed finding still costs only that finding.
     """
     matches = list(FENCED_BLOCK.finditer(response))
-    # Both branches guarantee a block starting at "[", so the scan below
+    # All three branches guarantee a block starting at "[", so the scan below
     # always decodes at least once.
     block = matches[-1].group(1) if matches else None
     if block is None and response.strip().startswith("["):
         block = response.strip()
+    if block is None:
+        # No closing fence: hand the unterminated remainder to the same
+        # salvage path a malformed block takes.
+        truncated = UNTERMINATED_FENCED_BLOCK.search(response)
+        if truncated is not None:
+            block = truncated.group(1)
+            print(
+                "  findings block has no closing fence (output was likely "
+                "truncated); attempting to recover complete findings from it"
+            )
     if block is None:
         raise ReviewerOutputError("response contained no JSON findings array")
 
@@ -1325,7 +1382,7 @@ GROUP_SIMILARITY = SIMILARITY
 # Where a path's recipe begins. Two findings in different recipes are never
 # "the same thing in another place" — they are two recipes each needing a fix,
 # and collapsing them tells one author and silences the rest.
-_RECIPE_KEY = re.compile(r"^((?:core|contrib|skills)/[^/]+(?:/[^/]+)?)")
+_RECIPE_KEY = re.compile(r"^((?:core|contrib|plugins)/[^/]+(?:/[^/]+)?)")
 
 
 def _group_scope(path: str, trusted: bool = False) -> str:
@@ -1685,6 +1742,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="the exact diff the reviewer was shown",
     )
     parser.add_argument(
+        "--pr-diff",
+        type=Path,
+        default=None,
+        help="the PR's whole base...head diff, when --diff is an incremental "
+        "one. Inline anchors are limited to lines this diff adds, because "
+        "GitHub rejects a comment on any other line",
+    )
+    parser.add_argument(
         "--label", required=True, help="review type, e.g. Correctness"
     )
     parser.add_argument(
@@ -1959,6 +2024,14 @@ def _post(args, findings: list) -> int:
         print(f"{len(existing)} comment(s) already on this PR.")
 
     anchors, line_text = walk_right_side(diff)
+    if args.pr_diff is not None:
+        try:
+            pr_diff = args.pr_diff.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return report_infra_fault(
+                infra_fault(CHECKER, f"cannot read diff {args.pr_diff}: {exc}")
+            )
+        anchors = restrict_to_pr(anchors, pr_diff)
     comments, notes, skipped = build_comments(
         findings, anchors, line_text, existing
     )

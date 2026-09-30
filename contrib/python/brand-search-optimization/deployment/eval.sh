@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,19 +13,16 @@
 # limitations under the License.
 
 set -x
+set -e
 
 prepare(){
     touch __init__.py
-    export PYTHONPATH=:.
-}
-
-remove_selenium(){
-    rm -rf selenium
+    export PYTHONPATH="$PYTHONPATH:."
 }
 
 run_eval(){
     adk eval \
-        brand_search_optimization \
+        app \
         eval/data/eval_data1.evalset.json \
         --config_file_path eval/data/test_config.json
 }
@@ -33,10 +30,9 @@ run_eval(){
 main(){
     echo "
     You must be inside brand-search-optimization dir and then
-    # sh deployment/eval/eval.sh
+    # sh deployment/eval.sh
     "
     prepare
-    remove_selenium
     run_eval
 }
 

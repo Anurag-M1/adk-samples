@@ -1,4 +1,4 @@
-<!-- word count: 948 (target 900, cap 1200) -->
+<!-- word count: 985 (target 900, cap 1200) -->
 
 # Recipe Checklist
 
@@ -10,7 +10,7 @@ Deep detail lives in [`recipe-handbook/`](./recipe-handbook/README.md).
 ## Proposing a new recipe
 
 If this is a **new** recipe, open a
-[Propose a New Recipe](https://github.com/google/adk-samples/issues/new?template=propose-a-new-recipe.md)
+[Propose a New Recipe](https://github.com/google/adk-recipes/issues/new?template=propose-a-new-recipe.md)
 issue and wait for approval before adding it to `contrib/` and
 opening a PR. Updating an existing recipe? Skip this and go
 straight to the checklist.
@@ -32,7 +32,7 @@ skill in the right order.
 | `align-recipe-pyproject` | Fixes `pyproject.toml` to match repo conventions | `align pyproject.toml for contrib/python/my-recipe` |
 | `extract-python-environment-variables` | Populates `.env.example` from Python source and adds `load_dotenv()` where needed | `extract env vars for contrib/python/my-recipe` |
 | `generate-python-runnability-test` | Writes `tests/test_runnability.py` | `generate runnability test for contrib/python/my-recipe` |
-| `make-python-recipe-deployable` | Adds the serving files so the recipe can run as a container. Opt-in — not run by `prepare-python-recipe` | `make contrib/python/my-recipe deployable` |
+| `make-python-recipe-deployable` | Adds the `Dockerfile` and serving files so the recipe can run as a container. Required for `contrib/`; not run by `prepare-python-recipe` | `make contrib/python/my-recipe deployable` |
 
 For deep detail on each skill, see the
 [Repo Skills Catalog](./recipe-handbook/skills-catalog.md).
@@ -52,6 +52,10 @@ For deep detail on each skill, see the
       doc-only screenshots/diagrams
 - [ ] `manifest.yaml` valid, with real `ownership.team` and
       `ownership.poc` — AI skill: `generate-manifest`
+- [ ] A root `Dockerfile` that builds and serves the agent, and
+      `deployable: true` in `manifest.yaml` — AI skill (Python):
+      `make-python-recipe-deployable`;
+      [details](./recipe-handbook/troubleshooting.md#contrib-recipe-is-not-deployable)
 - [ ] `README.md` has ≥ 100 words, a setup section, and a run
       section with a code block — CI enforces this;
       [details](./recipe-handbook/anatomy.md#readmemd)

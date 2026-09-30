@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ def load_env():
 async def test_all():
     """Test the agent's basic ability on a few examples."""
     await AgentEvaluator.evaluate(
-        agent_module="brand_search_optimization",
+        agent_module="app",
         eval_dataset_file_path_or_dir=str(
             pathlib.Path(__file__).parent / "data"
         ),
