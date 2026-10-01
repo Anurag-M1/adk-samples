@@ -179,12 +179,30 @@ EXPOSE 8080
 CMD ["uv", "run", "uvicorn", "app.fast_api_app:app", "--host", "0.0.0.0", "--port", "8080"]
 ```
 
-2. **Mount the static files in `app/fast_api_app.py`** so that the FastAPI app serves the frontend at the root while keeping `/api/*` routed to ADK:
+2. **Mount the static files and route `/api/*` to ADK in `app/fast_api_app.py`**:
+
+The React frontend sends requests to `/api/run_sse`, `/api/docs`, and `/api/apps/...`. In local development, the Vite dev server strips the `/api` prefix via its dev proxy. In production, add an ASGI middleware to strip the `/api` prefix so calls route directly to ADK endpoints on FastAPI, and mount the static frontend files at the root:
 
 ```python
 from pathlib import Path
 from fastapi.staticfiles import StaticFiles
+from starlette.types import ASGIApp, Receive, Scope, Send
 
+
+# Strip '/api' prefix so frontend requests route to ADK endpoints (/run_sse, /apps, /docs)
+class StripApiPrefixMiddleware:
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] == "http" and scope["path"].startswith("/api/"):
+            scope["path"] = scope["path"][4:]
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(StripApiPrefixMiddleware)
+
+# Mount frontend static build at root
 frontend_dist = Path("frontend/dist")
 if frontend_dist.exists():
     app.mount("/", StaticFiles(directory=str(frontend_dist), html=True), name="frontend")
